@@ -19,15 +19,13 @@ package kubevirt
 import (
 	"context"
 	"fmt"
-
 	"go.uber.org/zap"
-	cdiv1beta1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
-
 	kubermaticv1 "k8c.io/kubermatic/v2/pkg/apis/kubermatic/v1"
 	kuberneteshelper "k8c.io/kubermatic/v2/pkg/kubernetes"
 	"k8c.io/kubermatic/v2/pkg/provider"
 	"k8c.io/kubermatic/v2/pkg/resources/reconciling"
 	reconciling2 "k8c.io/reconciler/pkg/reconciling"
+	cdiv1beta1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -39,12 +37,15 @@ import (
 )
 
 const (
-	dataVolumeStandardImageAnnotation = "kubevirt-initialization.k8c.io/standard-image"
-	dataVolumeRetainAnnotation        = "cdi.kubevirt.io/storage.deleteAfterCompletion"
-	dataVolumeStandardImageSize       = "11Gi"
-	kubevirtImagesClusterRole         = "datavolume-cloner"
-	kubevirtImagesRoleBinding         = "allow-datavolume-cloning"
+	dataVolumeStandardImageAnnotation   = "kubevirt-initialization.k8c.io/standard-image"
+	dataVolumeRetainAnnotation          = "cdi.kubevirt.io/storage.deleteAfterCompletion"
+	dataVolumeOsAnnotationForCustomDisk = "cdi.kubevirt.io/os-type"
+	dataVolumeStandardImageSize         = "11Gi"
+	kubevirtImagesClusterRole           = "datavolume-cloner"
+	kubevirtImagesRoleBinding           = "allow-datavolume-cloning"
 )
+
+type dataVolumeAnnotationFilter func(map[string]string) bool
 
 func dataVolumeReconciler(datavolume *cdiv1beta1.DataVolume) reconciling.NamedDataVolumeReconcilerFactory {
 	return func() (name string, create reconciling.DataVolumeReconciler) {
@@ -66,6 +67,14 @@ func reconcileDataVolume(ctx context.Context, client ctrlruntimeclient.Client, d
 // reconcileCustomImages reconciles the custom-disks from cluster.
 func reconcileCustomImages(ctx context.Context, cluster *kubermaticv1.Cluster, client ctrlruntimeclient.Client, logger *zap.SugaredLogger, isCustomImagesEnabled bool) error {
 	if isCustomImagesEnabled {
+		// pdvToBeRemoved contains custom-images that are candidates for removal
+		pdvToBeRemoved, err := getExistingDataVolumes(ctx, cluster.Status.NamespaceName, client, func(customDvAnnotations map[string]string) bool {
+			return customDvAnnotations != nil && customDvAnnotations[dataVolumeOsAnnotationForCustomDisk] != ""
+		})
+		if err != nil {
+			return err
+		}
+
 		for _, d := range cluster.Spec.Cloud.Kubevirt.PreAllocatedDataVolumes {
 			if d.Annotations == nil {
 				d.Annotations = make(map[string]string)
@@ -74,34 +83,29 @@ func reconcileCustomImages(ctx context.Context, cluster *kubermaticv1.Cluster, c
 			dv, err := newDataVolume(d, cluster.Status.NamespaceName)
 			if err != nil {
 				logger.Error("error generating custom image Data Volume: %s", err)
-				continue
+				return err
 			}
 			if err = reconcileDataVolume(ctx, client, dv, cluster.Status.NamespaceName); err != nil {
 				logger.Error("failed to reconcile DataVolume: %s", err)
-				continue
+				return err
 			}
+			// remove the created/updated dv from the removal map.
+			delete(pdvToBeRemoved, d.Name)
 		}
+		// delete custom-image DV that are removed from cluster-object.
+		return deleteDataVolumes(ctx, pdvToBeRemoved, client)
 	}
 	return nil
 }
 
 // reconcileStandardImagesCache reconciles the DataVolumes for standard VM images if cloning is enabled.
 func reconcileStandardImagesCache(ctx context.Context, dc *kubermaticv1.DatacenterSpecKubevirt, client ctrlruntimeclient.Client, logger *zap.SugaredLogger) error {
-	existingDiskList := cdiv1beta1.DataVolumeList{}
-	listOption := ctrlruntimeclient.ListOptions{
-		Namespace: KubeVirtImagesNamespace,
-	}
-	if err := client.List(ctx, &existingDiskList, &listOption); ctrlruntimeclient.IgnoreNotFound(err) != nil {
+	// pdvToBeRemoved contains standard-images that are candidates for removal
+	pdvToBeRemoved, err := getExistingDataVolumes(ctx, KubeVirtImagesNamespace, client, func(standardDvAnnotations map[string]string) bool {
+		return standardDvAnnotations != nil && standardDvAnnotations[dataVolumeStandardImageAnnotation] == "true"
+	})
+	if err != nil {
 		return err
-	}
-
-	// pdvToBeRemoved contains info about pdv that are going to be removed.
-	pdvToBeRemoved := make(map[string]cdiv1beta1.DataVolume)
-	for _, dv := range existingDiskList.Items {
-		// only consider preAllocated DV and ignore custom-disks.
-		if dv.Annotations[dataVolumeStandardImageAnnotation] == "true" {
-			pdvToBeRemoved[dv.Name] = dv
-		}
 	}
 
 	for os, osVersion := range dc.Images.HTTP.OperatingSystems {
@@ -117,29 +121,29 @@ func reconcileStandardImagesCache(ctx context.Context, dc *kubermaticv1.Datacent
 				StorageClass: dc.Images.HTTP.ImageCloning.StorageClass,
 			}
 
+			// if url is changed for an existing standard DV, remove to existing DV before reconciliation
+			if existingDV, exist := pdvToBeRemoved[pdvCreateOrUpdate.Name]; exist && existingDV.Spec.Source.HTTP.URL != url {
+				if err := client.Delete(ctx, &existingDV); ctrlruntimeclient.IgnoreNotFound(err) != nil {
+					return err
+				}
+			}
+
 			// remove the created/updated pdv from the removal map.
 			delete(pdvToBeRemoved, pdvCreateOrUpdate.Name)
 
 			dv, err := newDataVolume(pdvCreateOrUpdate, KubeVirtImagesNamespace)
 			if err != nil {
 				logger.Error("error generating new Data Volume: %s", err)
-				continue
+				return err
 			}
 			if err = reconcileDataVolume(ctx, client, dv, KubeVirtImagesNamespace); err != nil {
 				logger.Error("failed to reconcile DataVolume: %s", err)
-				continue
+				return err
 			}
 		}
 	}
-
-	for _, dv := range pdvToBeRemoved {
-		if err := client.Delete(ctx, &dv); ctrlruntimeclient.IgnoreNotFound(err) != nil {
-			logger.Error("failed to remove Allocated DataVolume: %s", err)
-			continue
-		}
-	}
-
-	return nil
+	// delete standard-images which are removed from seed-config.
+	return deleteDataVolumes(ctx, pdvToBeRemoved, client)
 }
 
 func newDataVolume(dv kubermaticv1.PreAllocatedDataVolume, namespace string) (*cdiv1beta1.DataVolume, error) {
@@ -240,4 +244,34 @@ func deleteKubeVirtImagesRoleBinding(ctx context.Context, name string, client ct
 		return ctrlruntimeclient.IgnoreNotFound(err)
 	}
 	return client.Delete(ctx, roleBinding)
+}
+
+// getExistingDataVolumes returns a map of DataVolumes based on annotation filter.
+func getExistingDataVolumes(ctx context.Context, namespace string, client ctrlruntimeclient.Client, annotationFilter dataVolumeAnnotationFilter) (map[string]cdiv1beta1.DataVolume, error) {
+	existingDiskList := cdiv1beta1.DataVolumeList{}
+	listOption := ctrlruntimeclient.ListOptions{
+		Namespace: namespace,
+	}
+	if err := client.List(ctx, &existingDiskList, &listOption); ctrlruntimeclient.IgnoreNotFound(err) != nil {
+		return nil, err
+	}
+
+	dvMap := make(map[string]cdiv1beta1.DataVolume)
+	for _, dv := range existingDiskList.Items {
+		// only consider DV which are filtered
+		if annotationFilter(dv.Annotations) {
+			dvMap[dv.Name] = dv
+		}
+	}
+	return dvMap, nil
+}
+
+// deleteDataVolumes specified in dvToBeRemoved.
+func deleteDataVolumes(ctx context.Context, dvToBeRemoved map[string]cdiv1beta1.DataVolume, client ctrlruntimeclient.Client) error {
+	for _, dv := range dvToBeRemoved {
+		if err := client.Delete(ctx, &dv); ctrlruntimeclient.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+	return nil
 }

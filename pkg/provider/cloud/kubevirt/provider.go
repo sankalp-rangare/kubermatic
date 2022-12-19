@@ -72,6 +72,14 @@ func (k *kubevirt) DefaultCloudSpec(ctx context.Context, spec *kubermaticv1.Clou
 		return err
 	}
 
+	// add imageCloning flag to cloudSpec
+	spec.Kubevirt.ImageCloning = k.dc.Images.HTTP != nil && k.dc.Images.HTTP.ImageCloning.Enable
+
+	// if custom-image is disabled, remove
+	if !k.dc.Images.EnableCustomImages {
+		spec.Kubevirt.PreAllocatedDataVolumes = nil
+	}
+
 	return updateInfraStorageClassesInfo(ctx, client, spec)
 }
 

@@ -1201,6 +1201,8 @@ type KubevirtCloudSpec struct {
 	// InfraStorageClasses is a list of storage classes from KubeVirt infra cluster that are used for
 	// initialization of user cluster storage classes by the CSI driver kubevirt (hot pluggable disks)
 	InfraStorageClasses []string `json:"infraStorageClasses,omitempty"`
+	// ImageCloning flag enable/disable cloning for a cluster.
+	ImageCloning bool `json:"imageCloning,omitempty"`
 }
 
 type PreAllocatedDataVolume struct {
